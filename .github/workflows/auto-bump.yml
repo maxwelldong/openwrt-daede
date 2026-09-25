@@ -1,9 +1,7 @@
-name: Auto bump dae/daed
+name: Check dae/daed upstream
 
-# Tracks daeuniverse core frequently and the olicesx perf combo weekly, gates on
-# a real SDK build, and only then publishes. main stays clean until the gate is
-# green: each run uses its own auto-bump-staging-* branch; main is fast-forwarded
-# only from the exact SHA that passed the gate.
+# Scheduled runs report upstream changes without modifying pins or publishing.
+# Manual runs assemble and validate a candidate on an isolated staging branch.
 
 on:
   schedule:
@@ -23,7 +21,6 @@ on:
 permissions:
   contents: write
   actions: write
-  issues: write
 
 concurrency:
   group: auto-bump-dae-daed
@@ -39,6 +36,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Select sync lane
         id: lane
@@ -165,8 +163,46 @@ jobs:
               ;;
           esac
 
+      - name: Summarize scheduled upstream check
+        if: github.event_name == 'schedule'
+        env:
+          LANE: ${{ steps.lane.outputs.lane }}
+          CHANGED: ${{ steps.detect.outputs.changed }}
+          CHANGES: ${{ steps.detect.outputs.changes }}
+          DAED_SHA: ${{ steps.detect.outputs.daed }}
+          WING_SHA: ${{ steps.detect.outputs.wing }}
+          CORE_SHA: ${{ steps.detect.outputs.core_up }}
+          OUTBOUND_SHA: ${{ steps.detect.outputs.outbound }}
+          QUICGO_SHA: ${{ steps.detect.outputs.quicgo }}
+        run: |
+          if [ "$CHANGED" = true ]; then
+            echo "::warning::Upstream update pending compatibility review: $CHANGES"
+          fi
+          {
+            echo "## $LANE upstream check"
+            if [ "$CHANGED" = true ]; then
+              echo "Pending review: $CHANGES"
+              if [ "$LANE" = core ]; then
+                echo "daed: \`$DAED_SHA\`"
+                echo "dae-wing: \`$WING_SHA\`"
+                echo "dae core: \`$CORE_SHA\`"
+              else
+                echo "outbound: \`$OUTBOUND_SHA\`"
+                echo "quic-go: \`$QUICGO_SHA\`"
+              fi
+              echo "Run this workflow manually to build and validate the candidate."
+            else
+              echo "No upstream change."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/setup-go@v6
+        if: github.event_name == 'workflow_dispatch' && steps.detect.outputs.changed == 'true'
+        with:
+          go-version: "1.26.0"
+
       - name: Sync kenzok8 forks from olicesx
-        if: steps.detect.outputs.changed == 'true'
+        if: github.event_name == 'workflow_dispatch' && steps.detect.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
           LANE: ${{ steps.lane.outputs.lane }}
@@ -218,7 +254,7 @@ jobs:
 
       - name: Stage new pins
         id: stage
-        if: steps.detect.outputs.changed == 'true'
+        if: github.event_name == 'workflow_dispatch' && steps.detect.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           LANE: ${{ steps.lane.outputs.lane }}
@@ -255,12 +291,13 @@ jobs:
             echo "::error::staging commit is not a full 40-character SHA: $staging_sha"
             exit 1
           fi
-          git push --force origin "HEAD:refs/heads/$STAGING"
+          git -c credential.helper='!gh auth git-credential' \
+            push --force origin "HEAD:refs/heads/$STAGING"
           echo "staging_sha=$staging_sha" >> "$GITHUB_OUTPUT"
 
       - name: Assemble + gate build on staging
         id: gate
-        if: steps.detect.outputs.changed == 'true'
+        if: github.event_name == 'workflow_dispatch' && steps.detect.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           INITIAL_SHA: ${{ steps.stage.outputs.staging_sha }}
@@ -278,6 +315,31 @@ jobs:
             require_sha "$fetched_sha" staging
             printf '%s\n' "$fetched_sha"
           }
+          wait_run() {
+            local id=$1 fails=0 out status conclusion
+            while :; do
+              if out=$(gh run view "$id" --json status,conclusion --jq '.status + " " + (.conclusion // "")' 2>&1); then
+                fails=0
+                read -r status conclusion <<<"$out"
+                if [ "$status" = completed ]; then
+                  echo "run $id finished: $conclusion"
+                  if [ "$conclusion" != success ]; then
+                    echo "::error::run $id concluded $conclusion"
+                    return 1
+                  fi
+                  return 0
+                fi
+              else
+                fails=$((fails + 1))
+                echo "::warning::polling run $id failed ($fails/20): $out"
+                if [ "$fails" -ge 20 ]; then
+                  echo "::error::cannot poll run $id"
+                  return 1
+                fi
+              fi
+              sleep 30
+            done
+          }
           run_and_wait() { # <workflow-file> <expected-sha> [dispatch args...]
             workflow=$1
             expected_sha=$2
@@ -288,27 +350,28 @@ jobs:
               echo "::error::$STAGING moved to $remote_sha before dispatching $workflow; expected $expected_sha"
               exit 1
             fi
-            gh workflow run "$workflow" --ref "$STAGING" "$@"
-            run_id=""
-            for _ in {1..60}; do
-              run_id=$(gh run list --workflow "$workflow" --branch "$STAGING" \
-                --event workflow_dispatch --limit 20 --json databaseId,headSha \
-                --jq "map(select(.headSha == \"$expected_sha\")) | first | .databaseId // empty")
-              [ -n "$run_id" ] && break
-              sleep 2
-            done
+            dispatch_output=$(gh workflow run "$workflow" --ref "$STAGING" "$@")
+            echo "$dispatch_output"
+            run_id=$(printf '%s\n' "$dispatch_output" \
+              | sed -nE 's|.*actions/runs/([0-9]+).*|\1|p' | tail -1)
             if ! [[ "$run_id" =~ ^[0-9]+$ ]]; then
-              echo "::error::cannot find $workflow run for $STAGING at $expected_sha"
+              echo "::error::cannot read dispatched $workflow run ID"
               exit 1
             fi
-            actual_sha=$(gh run view "$run_id" --json headSha --jq '.headSha')
+            actual_sha=""
+            for _ in {1..60}; do
+              if actual_sha=$(gh run view "$run_id" --json headSha --jq '.headSha' 2>/dev/null); then
+                break
+              fi
+              sleep 2
+            done
             require_sha "$actual_sha" "$workflow run head"
             if [ "$actual_sha" != "$expected_sha" ]; then
               echo "::error::$workflow run $run_id uses $actual_sha, expected $expected_sha"
               exit 1
             fi
             echo "watching $workflow run $run_id at $expected_sha"
-            gh run watch "$run_id" --exit-status
+            wait_run "$run_id"
             LAST_RUN_ID=$run_id
           }
 
@@ -322,7 +385,15 @@ jobs:
           current_sha=$(fetch_staging_sha)
           run_and_wait assemble-daed-src.yml "$current_sha"
           tested_sha=$(fetch_staging_sha)
-          # gate: real SDK compile, no publish. gh-action-sdk exits 0 on failure, so assert the packages exist.
+          audit_dir=$(mktemp -d)
+          trap 'rm -rf "$audit_dir"' EXIT
+          git archive "$tested_sha" | tar -x -C "$audit_dir"
+          env -u GH_TOKEN -u GITHUB_TOKEN bash "$audit_dir/scripts/audit-upstream.sh" "$audit_dir"
+          # A single real SDK build catches wing/core compile errors before the
+          # full matrix. The test workflow also checks for both package files.
+          run_and_wait test-daed-build.yml "$tested_sha" -f packages="dae daed" -f arch=x86_64 -f sdk=25.12
+          # Full release matrix, no publish. gh-action-sdk exits 0 on failure,
+          # so assert every expected package artifact exists.
           run_and_wait test-daed-build.yml "$tested_sha" -f packages="dae daed"
           gate_run_id=$LAST_RUN_ID
           after_gate_sha=$(fetch_staging_sha)
@@ -331,163 +402,54 @@ jobs:
             exit 1
           fi
           rm -rf gate-artifacts
-          gh run download "$gate_run_id" -D gate-artifacts
-          for pkg in dae daed; do
-            find gate-artifacts \( -name "${pkg}-*.apk" -o -name "${pkg}_*.ipk" \) -print -quit | grep -q . || {
-              echo "gate failed: $pkg produced no package"; exit 1; }
-          done
-          echo "tested_sha=$tested_sha" >> "$GITHUB_OUTPUT"
-
-      - name: Promote to main and publish
-        if: steps.detect.outputs.changed == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TESTED_SHA: ${{ steps.gate.outputs.tested_sha }}
-        run: |
-          set -euo pipefail
-          require_sha() {
-            if ! [[ "$1" =~ ^[0-9a-f]{40}$ ]]; then
-              echo "::error::$2 is not a full 40-character commit SHA: ${1:-<empty>}"
+          mkdir -p gate-artifacts
+          artifacts=(
+            pkgs-aarch64_cortex-a53-24.10
+            pkgs-aarch64_cortex-a53-25.12
+            pkgs-aarch64_cortex-a72-24.10
+            pkgs-aarch64_cortex-a72-25.12
+            pkgs-aarch64_generic-24.10
+            pkgs-aarch64_generic-25.12
+            pkgs-arm_cortex-a7_neon-vfpv4-24.10
+            pkgs-arm_cortex-a7_neon-vfpv4-25.12
+            pkgs-arm_cortex-a9-24.10
+            pkgs-arm_cortex-a9-25.12
+            pkgs-arm_cortex-a9_neon-24.10
+            pkgs-arm_cortex-a9_neon-25.12
+            pkgs-i386_pentium4-24.10
+            pkgs-i386_pentium4-25.12
+            pkgs-x86_64-24.10
+            pkgs-x86_64-25.12
+          )
+          for artifact in "${artifacts[@]}"; do
+            gh run download "$gate_run_id" --name "$artifact" --dir "gate-artifacts/$artifact"
+            [ -d "gate-artifacts/$artifact" ] || {
+              echo "::error::missing downloaded artifact directory: $artifact"
               exit 1
-            fi
-          }
-          require_sha "$TESTED_SHA" tested
-          git cat-file -e "$TESTED_SHA^{commit}"
-          staging_sha=$(git ls-remote origin "refs/heads/$STAGING" | cut -f1)
-          require_sha "$staging_sha" staging
-          if [ "$staging_sha" != "$TESTED_SHA" ]; then
-            echo "::error::$STAGING is $staging_sha, but gate tested $TESTED_SHA"
-            exit 1
-          fi
-          git push origin "$TESTED_SHA:refs/heads/main"
-          main_sha=$(git ls-remote origin refs/heads/main | cut -f1)
-          require_sha "$main_sha" main
-          if [ "$main_sha" != "$TESTED_SHA" ]; then
-            echo "::error::main is $main_sha after promoting $TESTED_SHA"
-            exit 1
-          fi
-
-          gh workflow run release.yml --ref "$STAGING" -f prerelease=false
-          release_run_id=""
-          for _ in {1..60}; do
-            release_run_id=$(gh run list --workflow release.yml --branch "$STAGING" \
-              --event workflow_dispatch --limit 20 --json databaseId,headSha \
-              --jq "map(select(.headSha == \"$TESTED_SHA\")) | first | .databaseId // empty")
-            [ -n "$release_run_id" ] && break
-            sleep 2
+            }
+            for package in dae daed; do
+              found=0
+              while IFS= read -r -d '' file; do
+                name=${file##*/}
+                case "$name" in
+                  "$package"-*.apk|"$package"_*.apk|"$package"-*.ipk|"$package"_*.ipk)
+                    found=1
+                    break
+                    ;;
+                esac
+              done < <(find "gate-artifacts/$artifact" -type f \( -name '*.apk' -o -name '*.ipk' \) -print0)
+              [ "$found" -eq 1 ] || {
+                echo "::error::$artifact has no $package package artifact"
+                exit 1
+              }
+            done
           done
-          if ! [[ "$release_run_id" =~ ^[0-9]+$ ]]; then
-            echo "::error::cannot find release.yml run for $STAGING at $TESTED_SHA"
-            exit 1
-          fi
-          release_sha=$(gh run view "$release_run_id" --json headSha --jq '.headSha')
-          require_sha "$release_sha" release-run
-          if [ "$release_sha" != "$TESTED_SHA" ]; then
-            echo "::error::release run $release_run_id uses $release_sha, expected $TESTED_SHA"
-            exit 1
-          fi
-          echo "release.yml run $release_run_id dispatched from $STAGING at $TESTED_SHA"
-          # Keep the unique ref until checkout and publishing finish; the cleanup
-          # step may then remove it without racing the dispatched workflow.
-          gh run watch "$release_run_id" --exit-status
-
-      - name: Clean up staging branch
-        if: always() && steps.detect.outputs.changed == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          if ! [[ "$STAGING" =~ ^auto-bump-staging-[0-9]+-[0-9]+$ ]]; then
-            echo "::error::refusing to delete unexpected staging branch: $STAGING"
-            exit 1
-          fi
-          if gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$STAGING" >/dev/null 2>&1; then
-            gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$STAGING"
-            echo "Deleted $STAGING."
-          else
-            echo "$STAGING does not exist; nothing to clean."
-          fi
-
-  patch-absorbed:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - name: Check whether upstream absorbed our patches
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -eu
-          absorbed=""
-          scan() { # <pkgdir> <src subdir inside the tarball> <patch dirs...>
-            pkg="$1"
-            makefile="$pkg/Makefile"
-            srcdir="$2"
-            shift 2
-            src=$(sed -n 's/^PKG_SOURCE:=//p' "$makefile")
-            url=$(sed -n 's/^PKG_SOURCE_URL:=//p' "$makefile")
-            ver=$(sed -n 's/^PKG_VERSION:=//p' "$makefile")
-            [ -n "$src" ] && [ -n "$url" ] || {
-              echo "::error::cannot resolve source for $pkg"; return 1; }
-            rm -rf scan-src scan.tar.gz
-            curl -fsSL -o scan.tar.gz "$url/$src"
-            mkdir scan-src
-            tar xzf scan.tar.gz -C scan-src
-            d="scan-src/$pkg-$ver/$srcdir"
-            [ -d "$d" ] || {
-              echo "::error::missing source directory $d"; return 1; }
-            for patch_dir in "$@"; do
-              for p in "$pkg"/"$patch_dir"/*.patch; do
-                [ -f "$p" ] || continue
-                if patch -p1 -d "$d" --dry-run -R -f <"$p" >/dev/null 2>&1; then
-                  absorbed="${absorbed}\n- \`$p\`"
-                elif patch -p1 -d "$d" --dry-run -f <"$p" >/dev/null 2>&1; then
-                  patch -p1 -d "$d" -f <"$p" >/dev/null
-                else
-                  echo "::error::$p neither reverse-applies nor forward-applies"
-                  return 1
-                fi
-              done
-            done
-          }
-          scan_git() { # <name> <repo> <commit> <patch dir>
-            name="$1"
-            repo="$2"
-            commit="$3"
-            patch_dir="$4"
-            d="scan-git/$name"
-            rm -rf "$d"
-            git init -q "$d"
-            git -C "$d" remote add origin "$repo"
-            git -C "$d" fetch -q --depth=1 origin "$commit"
-            git -C "$d" checkout -q FETCH_HEAD
-            for p in "$patch_dir"/*.patch; do
-              [ -f "$p" ] || continue
-              if git -C "$d" apply --check -R "$GITHUB_WORKSPACE/$p" >/dev/null 2>&1; then
-                absorbed="${absorbed}\n- \`$p\`"
-              elif git -C "$d" apply --check "$GITHUB_WORKSPACE/$p" >/dev/null 2>&1; then
-                git -C "$d" apply "$GITHUB_WORKSPACE/$p"
-              else
-                echo "::error::$p neither reverse-applies nor forward-applies"
-                return 1
-              fi
-            done
-          }
-          . ci/pins.env
-          scan dae core patches patches_arm
-          scan daed wing patches patches_arm
-          scan_git outbound https://github.com/kenzok8/outbound "$OUTBOUND_COMMIT" ci/patches/outbound
-          scan_git quic-go https://github.com/kenzok8/quic-go "$QUICGO_BASE_COMMIT" ci/patches/quic-go
-          title="🧹 patches: upstream absorbed some of ours"
-          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "upstream absorbed in:title" --json number --jq '.[0].number' 2>/dev/null || echo "")
-          if [ -z "$absorbed" ]; then
-            echo "no patch is redundant."
-            [ -n "$existing" ] && gh issue close "$existing" --repo "$GITHUB_REPOSITORY" -c "No redundant patch left; auto-closing." || true
-            exit 0
-          fi
-          echo "::warning::these patches already exist upstream and can be dropped."
-          body=$(printf 'Automated check (auto-bump.yml).\n\nThese patches reverse-apply cleanly against the pinned source, meaning upstream already carries them. Keeping them risks a conflict on the next bump:\n%b\n\nDrop them (and bump PKG_RELEASE) after confirming the feature is still present.' "$absorbed")
-          if [ -n "$existing" ]; then
-            gh issue edit "$existing" --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
-          else
-            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
-          fi
+          echo "validated exact package artifacts: ${artifacts[*]}"
+          echo "tested_sha=$tested_sha" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Candidate ready for 252 testing"
+            echo "Staging branch: \`$STAGING\`"
+            echo "Validated commit: \`$tested_sha\`"
+            echo "16 SDK package sets contain dae and daed."
+            echo "Promote only after 252 testing and maintainer approval."
+          } >> "$GITHUB_STEP_SUMMARY"
